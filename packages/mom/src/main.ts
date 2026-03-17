@@ -91,6 +91,96 @@ interface ChannelState {
 }
 
 const channelStates = new Map<string, ChannelState>();
+const SLACK_MAIN_MAX_CHARS = 4000;
+const SLACK_MAIN_MAX_BYTES = 12000;
+const SLACK_THREAD_MAX_CHARS = 4000;
+const SLACK_THREAD_MAX_BYTES = 12000;
+
+function truncateSlackText(text: string, options: { maxChars: number; maxBytes: number; suffix: string }): string {
+	let result = text;
+
+	if (result.length > options.maxChars) {
+		result = result.slice(0, options.maxChars);
+	}
+
+	if (Buffer.byteLength(result, "utf8") <= options.maxBytes && result.length === text.length) {
+		return result;
+	}
+
+	const suffixBytes = Buffer.byteLength(options.suffix, "utf8");
+	const targetBytes = Math.max(0, options.maxBytes - suffixBytes);
+	const chars = Array.from(result);
+	let low = 0;
+	let high = chars.length;
+
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		const candidate = chars.slice(0, mid).join("");
+		if (Buffer.byteLength(candidate, "utf8") <= targetBytes) {
+			low = mid;
+		} else {
+			high = mid - 1;
+		}
+	}
+
+	return chars.slice(0, low).join("") + options.suffix;
+}
+
+function fitSlackTextChunk(text: string, options: { maxChars: number; maxBytes: number }): string {
+	const chars = Array.from(text);
+	if (chars.length <= options.maxChars && Buffer.byteLength(text, "utf8") <= options.maxBytes) {
+		return text;
+	}
+
+	let low = 0;
+	let high = Math.min(chars.length, options.maxChars);
+
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		const candidate = chars.slice(0, mid).join("");
+		if (Buffer.byteLength(candidate, "utf8") <= options.maxBytes) {
+			low = mid;
+		} else {
+			high = mid - 1;
+		}
+	}
+
+	return chars.slice(0, low).join("");
+}
+
+function splitSlackText(
+	text: string,
+	options: { maxChars: number; maxBytes: number; continuationPrefix?: string },
+): string[] {
+	if (!text) return [text];
+
+	const parts: string[] = [];
+	let remaining = text;
+	let first = true;
+
+	while (remaining) {
+		const prefix = first ? "" : (options.continuationPrefix ?? "");
+		const prefixChars = Array.from(prefix).length;
+		const prefixBytes = Buffer.byteLength(prefix, "utf8");
+		const chunk = fitSlackTextChunk(remaining, {
+			maxChars: Math.max(1, options.maxChars - prefixChars),
+			maxBytes: Math.max(1, options.maxBytes - prefixBytes),
+		});
+
+		if (!chunk) {
+			break;
+		}
+
+		parts.push(prefix + chunk);
+		const chunkLength = Array.from(chunk).length;
+		remaining = Array.from(remaining).slice(chunkLength).join("");
+		first = false;
+	}
+
+	return parts.length > 0
+		? parts
+		: [truncateSlackText(text, { maxChars: options.maxChars, maxBytes: options.maxBytes, suffix: "" })];
+}
 
 function getState(channelId: string): ChannelState {
 	let state = channelStates.get(channelId);
@@ -114,15 +204,49 @@ function getState(channelId: string): ChannelState {
 function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelState, isEvent?: boolean) {
 	let messageTs: string | null = null;
 	const threadMessageTs: string[] = [];
+	const continuationMessageTs: string[] = [];
 	let accumulatedText = "";
 	let isWorking = true;
 	const workingIndicator = " ...";
+	const threadTruncationNote = "\n\n_(truncated)_";
 	let updatePromise = Promise.resolve();
 
 	const user = slack.getUser(event.user);
 
 	// Extract event filename for status message
 	const eventFilename = isEvent ? event.text.match(/^\[EVENT:([^:]+):/)?.[1] : undefined;
+
+	const syncMainMessages = async (displayText: string) => {
+		const displayParts = splitSlackText(displayText, {
+			maxChars: SLACK_MAIN_MAX_CHARS,
+			maxBytes: SLACK_MAIN_MAX_BYTES,
+			continuationPrefix: "_(continued)_\n",
+		});
+
+		if (messageTs) {
+			await slack.updateMessage(event.channel, messageTs, displayParts[0]);
+		} else {
+			messageTs = await slack.postMessage(event.channel, displayParts[0]);
+		}
+
+		for (let i = 1; i < displayParts.length; i++) {
+			const continuationIndex = i - 1;
+			const existingTs = continuationMessageTs[continuationIndex];
+			if (existingTs) {
+				await slack.updateMessage(event.channel, existingTs, displayParts[i]);
+			} else {
+				const ts = await slack.postMessage(event.channel, displayParts[i]);
+				continuationMessageTs.push(ts);
+			}
+		}
+
+		while (continuationMessageTs.length > displayParts.length - 1) {
+			const ts = continuationMessageTs.pop();
+			if (ts) {
+				await slack.deleteMessage(event.channel, ts);
+			}
+		}
+	};
 
 	return {
 		message: {
@@ -143,22 +267,8 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 			updatePromise = updatePromise.then(async () => {
 				try {
 					accumulatedText = accumulatedText ? `${accumulatedText}\n${text}` : text;
-
-					// Truncate accumulated text if too long (Slack limit is 40K, we use 35K for safety)
-					const MAX_MAIN_LENGTH = 35000;
-					const truncationNote = "\n\n_(message truncated, ask me to elaborate on specific parts)_";
-					if (accumulatedText.length > MAX_MAIN_LENGTH) {
-						accumulatedText =
-							accumulatedText.substring(0, MAX_MAIN_LENGTH - truncationNote.length) + truncationNote;
-					}
-
 					const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
-
-					if (messageTs) {
-						await slack.updateMessage(event.channel, messageTs, displayText);
-					} else {
-						messageTs = await slack.postMessage(event.channel, displayText);
-					}
+					await syncMainMessages(displayText);
 
 					if (shouldLog && messageTs) {
 						slack.logBotResponse(event.channel, text, messageTs);
@@ -173,22 +283,9 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 		replaceMessage: async (text: string) => {
 			updatePromise = updatePromise.then(async () => {
 				try {
-					// Replace the accumulated text entirely, with truncation
-					const MAX_MAIN_LENGTH = 35000;
-					const truncationNote = "\n\n_(message truncated, ask me to elaborate on specific parts)_";
-					if (text.length > MAX_MAIN_LENGTH) {
-						accumulatedText = text.substring(0, MAX_MAIN_LENGTH - truncationNote.length) + truncationNote;
-					} else {
-						accumulatedText = text;
-					}
-
+					accumulatedText = text;
 					const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
-
-					if (messageTs) {
-						await slack.updateMessage(event.channel, messageTs, displayText);
-					} else {
-						messageTs = await slack.postMessage(event.channel, displayText);
-					}
+					await syncMainMessages(displayText);
 				} catch (err) {
 					log.logWarning("Slack replaceMessage error", err instanceof Error ? err.message : String(err));
 				}
@@ -200,12 +297,11 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 			updatePromise = updatePromise.then(async () => {
 				try {
 					if (messageTs) {
-						// Truncate thread messages if too long (20K limit for safety)
-						const MAX_THREAD_LENGTH = 20000;
-						let threadText = text;
-						if (threadText.length > MAX_THREAD_LENGTH) {
-							threadText = `${threadText.substring(0, MAX_THREAD_LENGTH - 50)}\n\n_(truncated)_`;
-						}
+						const threadText = truncateSlackText(text, {
+							maxChars: SLACK_THREAD_MAX_CHARS,
+							maxBytes: SLACK_THREAD_MAX_BYTES,
+							suffix: threadTruncationNote,
+						});
 
 						const ts = await slack.postInThread(event.channel, messageTs, threadText);
 						threadMessageTs.push(ts);
@@ -243,7 +339,7 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 					isWorking = working;
 					if (messageTs) {
 						const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
-						await slack.updateMessage(event.channel, messageTs, displayText);
+						await syncMainMessages(displayText);
 					}
 				} catch (err) {
 					log.logWarning("Slack setWorking error", err instanceof Error ? err.message : String(err));
@@ -254,16 +350,24 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 
 		deleteMessage: async () => {
 			updatePromise = updatePromise.then(async () => {
-				// Delete thread messages first (in reverse order)
 				for (let i = threadMessageTs.length - 1; i >= 0; i--) {
 					try {
 						await slack.deleteMessage(event.channel, threadMessageTs[i]);
 					} catch {
-						// Ignore errors deleting thread messages
+						// Ignore errors deleting thread messages.
 					}
 				}
 				threadMessageTs.length = 0;
-				// Then delete main message
+
+				for (let i = continuationMessageTs.length - 1; i >= 0; i--) {
+					try {
+						await slack.deleteMessage(event.channel, continuationMessageTs[i]);
+					} catch {
+						// Ignore errors deleting continuation messages.
+					}
+				}
+				continuationMessageTs.length = 0;
+
 				if (messageTs) {
 					await slack.deleteMessage(event.channel, messageTs);
 					messageTs = null;
