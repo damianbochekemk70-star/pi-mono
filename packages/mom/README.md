@@ -62,9 +62,15 @@ npm install @mariozechner/pi-mom
 # Set environment variables
 export MOM_SLACK_APP_TOKEN=xapp-...
 export MOM_SLACK_BOT_TOKEN=xoxb-...
-# Option 1: Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
-# Option 2: use /login command in pi agent, then copy/link auth.json to ~/.pi/mom/
+# Recommended: reuse pi auth via /login, then link ~/.pi/agent/auth.json to ~/.pi/mom/auth.json
+# Optional: force Codex when multiple providers are authenticated
+export MOM_PROVIDER=openai-codex
+# Optional: pin a specific model
+export MOM_MODEL=gpt-5.4
+# Optional: set reasoning level (default: high)
+export MOM_THINKING_LEVEL=high
+# Optional: hide reasoning content from Slack while keeping reasoning enabled
+export MOM_SHOW_THINKING_CONTENT=false
 
 # Create Docker sandbox (recommended)
 docker run -d \
@@ -95,24 +101,64 @@ Options:
 |----------|-------------|
 | `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...) |
 | `MOM_SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) |
-| `ANTHROPIC_API_KEY` | (Optional) Anthropic API key |
+| `MOM_PROVIDER` | (Optional) Force a provider, e.g. `openai-codex` |
+| `MOM_MODEL` | (Optional) Force a model id or `provider/model` reference |
+| `MOM_THINKING_LEVEL` | (Optional) Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `MOM_SHOW_THINKING_CONTENT` | (Optional) Show reasoning content in Slack: `true` or `false` |
+
+Mom also supports the same provider-specific API key environment variables as `pi`, for example `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
 
 ## Authentication
 
-Mom needs credentials for Anthropic API. The options to set it are:
+Mom uses the same provider auth system as `pi`. By default, it picks the first authenticated default model using the same provider preference order as the coding agent. That means a linked ChatGPT Plus/Pro Codex login now works without patching mom.
 
-1. **Environment Variable**
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-2. **OAuth Login via coding agent command** (Recommended for Claude Pro/Max)
+1. **OAuth Login via coding agent command** (Recommended for subscriptions)
 
 - run interactive coding agent session: `npx @mariozechner/pi-coding-agent`
 - enter `/login` command
-  - choose "Anthropic" provider
+  - choose `ChatGPT Plus/Pro (Codex Subscription)` for Codex
+  - or choose another supported provider such as `Anthropic`
   - follow instructions in the browser
-- link `auth.json` to mom: `ln -s ~/.pi/agent/auth.json ~/.pi/mom/auth.json`
+- link `auth.json` to mom:
+
+```bash
+mkdir -p ~/.pi/mom
+ln -s ~/.pi/agent/auth.json ~/.pi/mom/auth.json
+```
+
+2. **Provider-specific Environment Variable**
+
+Examples:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+3. **Optional model selection**
+
+If you have multiple providers authenticated and want Codex specifically:
+
+```bash
+export MOM_PROVIDER=openai-codex
+export MOM_MODEL=gpt-5.4
+```
+
+4. **Thinking level**
+
+Mom defaults to `high` thinking. Override it with:
+
+```bash
+export MOM_THINKING_LEVEL=medium
+```
+
+5. **Thinking visibility in Slack**
+
+Mom shows reasoning content in the main Slack message by default when the model returns it. Hide that content while keeping reasoning enabled with:
+
+```bash
+export MOM_SHOW_THINKING_CONTENT=false
+```
 
 ## How Mom Works
 

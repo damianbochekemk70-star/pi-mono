@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Mom now selects the first authenticated default model from pi's provider registry instead of hardcoding Anthropic, which enables ChatGPT Plus/Pro (Codex Subscription) logins and other pi-authenticated providers.
+- Added `MOM_PROVIDER` and `MOM_MODEL` environment variables to pin mom to a specific provider or model.
+- Mom now defaults to `high` thinking and supports `MOM_THINKING_LEVEL` to override the reasoning level.
+- Added `MOM_SHOW_THINKING_CONTENT` to control whether reasoning content is posted into Slack messages.
+
+### Fixed
+
+- Slack main-message truncation now clamps by UTF-8 byte size as well as character count, which avoids `msg_too_long` errors on long CJK-heavy responses.
+- Long Slack main-message updates now continue as additional channel messages instead of failing or being cut off in a single oversized message.
+
 ## [0.58.4] - 2026-03-16
 
 ## [0.58.3] - 2026-03-15
