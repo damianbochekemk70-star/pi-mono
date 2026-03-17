@@ -1,5 +1,5 @@
-import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, type ImageContent } from "@mariozechner/pi-ai";
+import { Agent, type AgentEvent, type ThinkingLevel } from "@mariozechner/pi-agent-core";
+import { type Api, getModel, type ImageContent, type Model } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -23,8 +23,36 @@ import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
-// Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+const BOOT_MODEL = getModel("anthropic", "claude-sonnet-4-5");
+const DEFAULT_THINKING_LEVEL: ThinkingLevel = "high";
+const VALID_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
+const FALSE_ENV_VALUES = new Set(["0", "false", "no", "off"]);
+const DEFAULT_MODEL_PER_PROVIDER: Record<string, string> = {
+	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
+	anthropic: "claude-opus-4-6",
+	openai: "gpt-5.4",
+	"azure-openai-responses": "gpt-5.2",
+	"openai-codex": "gpt-5.4",
+	google: "gemini-2.5-pro",
+	"google-gemini-cli": "gemini-2.5-pro",
+	"google-antigravity": "gemini-3.1-pro-high",
+	"google-vertex": "gemini-3-pro-preview",
+	"github-copilot": "gpt-4o",
+	openrouter: "openai/gpt-5.1-codex",
+	"vercel-ai-gateway": "anthropic/claude-opus-4-6",
+	xai: "grok-4-fast-non-reasoning",
+	groq: "openai/gpt-oss-120b",
+	cerebras: "zai-glm-4.6",
+	zai: "glm-4.6",
+	mistral: "devstral-medium-latest",
+	minimax: "MiniMax-M2.1",
+	"minimax-cn": "MiniMax-M2.1",
+	huggingface: "moonshotai/Kimi-K2.5",
+	opencode: "claude-opus-4-6",
+	"opencode-go": "kimi-k2.5",
+	"kimi-coding": "kimi-k2-thinking",
+};
 
 export interface PendingMessage {
 	userName: string;
@@ -42,16 +70,174 @@ export interface AgentRunner {
 	abort(): void;
 }
 
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
-	if (!key) {
+function modelRef(model: Model<Api>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function uniqueModels(models: Model<Api>[]): Model<Api>[] {
+	const seen = new Set<string>();
+	const result: Model<Api>[] = [];
+
+	for (const model of models) {
+		const ref = modelRef(model);
+		if (seen.has(ref)) continue;
+		seen.add(ref);
+		result.push(model);
+	}
+
+	return result;
+}
+
+function formatModelList(models: Model<Api>[]): string {
+	return models.map((model) => modelRef(model)).join(", ");
+}
+
+function findConfiguredModel(pattern: string, models: Model<Api>[], envName: "MOM_MODEL"): Model<Api> {
+	const normalizedPattern = pattern.toLowerCase();
+	const exactCanonical = models.filter((model) => modelRef(model).toLowerCase() === normalizedPattern);
+	if (exactCanonical.length === 1) return exactCanonical[0];
+
+	const exactId = models.filter((model) => model.id.toLowerCase() === normalizedPattern);
+	if (exactId.length === 1) return exactId[0];
+	if (exactId.length > 1) {
 		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
-				join(homedir(), ".pi", "mom", "auth.json"),
+			`${envName}="${pattern}" matches multiple authenticated models: ${formatModelList(exactId)}. ` +
+				`Set MOM_PROVIDER to disambiguate.`,
 		);
 	}
-	return key;
+
+	const partialMatches = models.filter(
+		(model) =>
+			modelRef(model).toLowerCase().includes(normalizedPattern) ||
+			model.id.toLowerCase().includes(normalizedPattern) ||
+			model.name.toLowerCase().includes(normalizedPattern),
+	);
+	if (partialMatches.length === 1) return partialMatches[0];
+	if (partialMatches.length > 1) {
+		throw new Error(
+			`${envName}="${pattern}" matches multiple authenticated models: ${formatModelList(partialMatches)}. ` +
+				`Use a more specific model id or set MOM_PROVIDER.`,
+		);
+	}
+
+	throw new Error(
+		`${envName}="${pattern}" did not match any authenticated model. ` +
+			`Available authenticated models: ${formatModelList(models)}.`,
+	);
+}
+
+function buildNoModelsError(allModels: Model<Api>[]): Error {
+	const knownProviders = Array.from(new Set(allModels.map((model) => model.provider))).sort();
+	return new Error(
+		"No authenticated models available for mom.\n\n" +
+			'Authenticate with pi via /login (for example "ChatGPT Plus/Pro (Codex Subscription)" or "Anthropic"), ' +
+			"then link auth.json to " +
+			join(homedir(), ".pi", "mom", "auth.json") +
+			".\n\n" +
+			`Known providers in this build: ${knownProviders.join(", ")}`,
+	);
+}
+
+function getModelCandidates(modelRegistry: ModelRegistry): Model<Api>[] {
+	const allModels = modelRegistry.getAll();
+	const availableModels = modelRegistry.getAvailable();
+	const providerOverride = process.env.MOM_PROVIDER?.trim();
+	const modelOverride = process.env.MOM_MODEL?.trim();
+
+	if (providerOverride) {
+		const providerExists = allModels.some((model) => model.provider === providerOverride);
+		if (!providerExists) {
+			const knownProviders = Array.from(new Set(allModels.map((model) => model.provider)))
+				.sort()
+				.join(", ");
+			throw new Error(`Unknown MOM_PROVIDER="${providerOverride}". Known providers: ${knownProviders}`);
+		}
+
+		const providerModels = availableModels.filter((model) => model.provider === providerOverride);
+		if (providerModels.length === 0) {
+			throw new Error(
+				`No authenticated models available for MOM_PROVIDER="${providerOverride}". ` +
+					"Log in with pi /login or set the provider's API key first.",
+			);
+		}
+
+		if (modelOverride) {
+			return [findConfiguredModel(modelOverride, providerModels, "MOM_MODEL")];
+		}
+
+		const defaultModelId = DEFAULT_MODEL_PER_PROVIDER[providerOverride];
+		const defaultModel = defaultModelId ? providerModels.find((model) => model.id === defaultModelId) : undefined;
+		return uniqueModels(defaultModel ? [defaultModel, ...providerModels] : providerModels);
+	}
+
+	if (modelOverride) {
+		if (availableModels.length === 0) {
+			throw buildNoModelsError(allModels);
+		}
+		return uniqueModels([findConfiguredModel(modelOverride, availableModels, "MOM_MODEL"), ...availableModels]);
+	}
+
+	if (availableModels.length === 0) {
+		throw buildNoModelsError(allModels);
+	}
+
+	const defaults = Object.entries(DEFAULT_MODEL_PER_PROVIDER)
+		.map(([provider, modelId]) =>
+			availableModels.find((model) => model.provider === provider && model.id === modelId),
+		)
+		.filter((model): model is Model<Api> => model !== undefined);
+
+	return uniqueModels([...defaults, ...availableModels]);
+}
+
+async function resolveMomModel(modelRegistry: ModelRegistry): Promise<Model<Api>> {
+	const candidates = getModelCandidates(modelRegistry);
+
+	for (const candidate of candidates) {
+		const apiKey = await modelRegistry.getApiKey(candidate);
+		if (apiKey) {
+			return candidate;
+		}
+	}
+
+	throw new Error(
+		"No usable credentials available for mom after checking authenticated models. " +
+			`Tried: ${formatModelList(candidates)}.`,
+	);
+}
+
+function resolveMomThinkingLevel(): ThinkingLevel {
+	const configuredLevel = process.env.MOM_THINKING_LEVEL?.trim();
+	if (!configuredLevel) {
+		return DEFAULT_THINKING_LEVEL;
+	}
+
+	if (VALID_THINKING_LEVELS.includes(configuredLevel as ThinkingLevel)) {
+		return configuredLevel as ThinkingLevel;
+	}
+
+	throw new Error(
+		`Invalid MOM_THINKING_LEVEL="${configuredLevel}". ` + `Valid values: ${VALID_THINKING_LEVELS.join(", ")}`,
+	);
+}
+
+function resolveMomShowThinkingContent(): boolean {
+	const configuredValue = process.env.MOM_SHOW_THINKING_CONTENT?.trim();
+	if (!configuredValue) {
+		return true;
+	}
+
+	const normalizedValue = configuredValue.toLowerCase();
+	if (TRUE_ENV_VALUES.has(normalizedValue)) {
+		return true;
+	}
+	if (FALSE_ENV_VALUES.has(normalizedValue)) {
+		return false;
+	}
+
+	throw new Error(
+		`Invalid MOM_SHOW_THINKING_CONTENT="${configuredValue}". Valid values: true, false, 1, 0, yes, no, on, off`,
+	);
 }
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
@@ -359,35 +545,6 @@ function extractToolResultText(result: unknown): string {
 	return JSON.stringify(result);
 }
 
-function formatToolArgsForSlack(_toolName: string, args: Record<string, unknown>): string {
-	const lines: string[] = [];
-
-	for (const [key, value] of Object.entries(args)) {
-		if (key === "label") continue;
-
-		if (key === "path" && typeof value === "string") {
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			if (offset !== undefined && limit !== undefined) {
-				lines.push(`${value}:${offset}-${offset + limit}`);
-			} else {
-				lines.push(value);
-			}
-			continue;
-		}
-
-		if (key === "offset" || key === "limit") continue;
-
-		if (typeof value === "string") {
-			lines.push(value);
-		} else {
-			lines.push(JSON.stringify(value));
-		}
-	}
-
-	return lines.join("\n");
-}
-
 // Cache runners per channel
 const channelRunners = new Map<string, AgentRunner>();
 
@@ -435,12 +592,12 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const agent = new Agent({
 		initialState: {
 			systemPrompt,
-			model,
+			model: BOOT_MODEL,
 			thinkingLevel: "off",
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		getApiKey: async (provider) => modelRegistry.getApiKeyForProvider(provider),
 	});
 
 	// Load existing messages
@@ -492,6 +649,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			cacheWrite: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
+		showThinkingContent: true,
 		stopReason: "stop",
 		errorMessage: undefined as string | undefined,
 	};
@@ -529,20 +687,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			} else {
 				log.logToolSuccess(logCtx, agentEvent.toolName, durationMs, resultStr);
 			}
-
-			// Post args + result to thread
-			const label = pending?.args ? (pending.args as { label?: string }).label : undefined;
-			const argsFormatted = pending
-				? formatToolArgsForSlack(agentEvent.toolName, pending.args as Record<string, unknown>)
-				: "(args not found)";
-			const duration = (durationMs / 1000).toFixed(1);
-			let threadMessage = `*${agentEvent.isError ? "✗" : "✓"} ${agentEvent.toolName}*`;
-			if (label) threadMessage += `: ${label}`;
-			threadMessage += ` (${duration}s)\n`;
-			if (argsFormatted) threadMessage += `\`\`\`\n${argsFormatted}\n\`\`\`\n`;
-			threadMessage += `*Result:*\n\`\`\`\n${resultStr}\n\`\`\``;
-
-			queue.enqueueMessage(threadMessage, "thread", "tool result thread", false);
 
 			if (agentEvent.isError) {
 				queue.enqueue(() => ctx.respond(`_Error: ${truncate(resultStr, 200)}_`, false), "tool error");
@@ -591,14 +735,14 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
-					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
-					queue.enqueueMessage(`_${thinking}_`, "thread", "thinking thread", false);
+					if (runState.showThinkingContent) {
+						queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
+					}
 				}
 
 				if (text.trim()) {
 					log.logResponse(logCtx, text);
 					queue.enqueueMessage(text, "main", "response main");
-					queue.enqueueMessage(text, "thread", "response thread", false);
 				}
 			}
 		} else if (event.type === "auto_compaction_start") {
@@ -646,6 +790,40 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		): Promise<{ stopReason: string; errorMessage?: string }> {
 			// Ensure channel directory exists
 			await mkdir(channelDir, { recursive: true });
+
+			authStorage.reload();
+			modelRegistry.refresh();
+
+			try {
+				const selectedModel = await resolveMomModel(modelRegistry);
+				const selectedThinkingLevel = resolveMomThinkingLevel();
+				const showThinkingContent = resolveMomShowThinkingContent();
+				const currentModel = session.model;
+				if (
+					!currentModel ||
+					currentModel.provider !== selectedModel.provider ||
+					currentModel.id !== selectedModel.id
+				) {
+					await session.setModel(selectedModel);
+					log.logInfo(`[${channelId}] Using model ${selectedModel.provider}/${selectedModel.id}`);
+				}
+				session.setThinkingLevel(selectedThinkingLevel);
+				runState.showThinkingContent = showThinkingContent;
+				log.logInfo(`[${channelId}] Using thinking level ${selectedThinkingLevel}`);
+				log.logInfo(`[${channelId}] Show thinking content in Slack: ${showThinkingContent}`);
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				try {
+					await ctx.replaceMessage("_Sorry, something went wrong_");
+					await ctx.respondInThread(`_Error: ${errorMessage}_`);
+				} catch (postError) {
+					log.logWarning(
+						`[${channelId}] Failed to post model selection error`,
+						postError instanceof Error ? postError.message : String(postError),
+					);
+				}
+				return { stopReason: "error", errorMessage };
+			}
 
 			// Sync messages from log.jsonl that arrived while we were offline or busy
 			// Exclude the current message (it will be added via prompt())
@@ -773,6 +951,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// Debug: write context to last_prompt.jsonl
 			const debugContext = {
 				systemPrompt,
+				model: session.model ? modelRef(session.model) : undefined,
 				messages: session.messages,
 				newUserMessage: userMessage,
 				imageAttachmentCount: imageAttachments.length,
@@ -814,38 +993,12 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					}
 				} else if (finalText.trim()) {
 					try {
-						const mainText =
-							finalText.length > SLACK_MAX_LENGTH
-								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
-								: finalText;
-						await ctx.replaceMessage(mainText);
+						await ctx.replaceMessage(finalText);
 					} catch (err) {
 						const errMsg = err instanceof Error ? err.message : String(err);
 						log.logWarning("Failed to replace message with final text", errMsg);
 					}
 				}
-			}
-
-			// Log usage summary with context info
-			if (runState.totalUsage.cost.total > 0) {
-				// Get last non-aborted assistant message for context calculation
-				const messages = session.messages;
-				const lastAssistantMessage = messages
-					.slice()
-					.reverse()
-					.find((m) => m.role === "assistant" && (m as any).stopReason !== "aborted") as any;
-
-				const contextTokens = lastAssistantMessage
-					? lastAssistantMessage.usage.input +
-						lastAssistantMessage.usage.output +
-						lastAssistantMessage.usage.cacheRead +
-						lastAssistantMessage.usage.cacheWrite
-					: 0;
-				const contextWindow = model.contextWindow || 200000;
-
-				const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
-				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
-				await queueChain;
 			}
 
 			// Clear run state
